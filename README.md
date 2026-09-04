@@ -1,139 +1,186 @@
 # DeCCP — Decentralized Central Counterparty
 
-DeCCP is a **Decentralized Central Counterparty**. “Central” describes the
-logical novation and risk function; “decentralized” describes who controls and
-verifies that function. Material state changes require signatures from a
-threshold authority set rather than one operator.
+DeCCP is a deterministic clearing and risk state machine for a decentralized
+central counterparty.
 
-## Boundary
+“Central” describes the logical role: obligations are accepted, netted,
+guaranteed, and resolved through one authoritative clearing state.
+“Decentralized” describes control: material changes require a threshold of
+independent authorities, and settlement is verified against DeFMI rather than
+trusted to one operator.
 
-- DeKYX verifies who may participate and returns a scoped subject-line proof.
-- DeCCP admits clearing members; records DeFMI-backed collateral references;
-  sets initial/variation margin; accepts obligations; computes deterministic
-  multilateral netting; manages guarantee capacity and holds; freezes defaults;
-  and applies the loss waterfall.
-- zkPI carries the typed executable instructions created from a DeCCP netting or
-  default-settlement context.
-- DeFMI owns the authoritative cash, security, collateral lock, and settlement
-  records. DeCCP stores only immutable DeFMI identifiers and receipts.
-- Aethel owns payment-stream and receivable semantics. `deccp-aethel` translates
-  an Aethel guarantee offer into a DeCCP reservation and later binds, releases,
-  or consumes it.
+This repository provides reusable Rust crates. It does not custody assets and
+is not, by itself, a licensed clearing house. It is a research implementation
+and has not been audited for production use.
 
-Incoming clearing obligations require an `InstructionPort` verification; a
-non-zero `zkpi_digest` alone is not accepted as proof. Outgoing netting legs
-carry an exact instruction-context digest, while DeFMI remains responsible for
-executing and finalizing the resulting instruction.
+## What DeCCP provides
 
-This directory is a standalone, locked Rust workspace rather than a crate added
-to QOMM or DeKYX. The enclosing TradFi repository ignores new `mvp/*` projects.
-`mvp/qomm/rust/qomm-harness/src/bin/export_repos.rs` publishes it as the
-`deccp` repository under the shared MIT `LICENSE` (the workspace manifest
-declares MIT to match); `defmi` takes it as a Git dependency. No nested Git
-history or remote is created here.
+- Threshold-governed clearing-book creation and policy changes.
+- Qualification-backed admission and lifecycle management of clearing members.
+- References to DeFMI-backed CCP capital, default funds, and collateral lots.
+- Initial and variation margin state.
+- Clearing cycles with Gross-Gross, Gross-Net, and Net-Net modes.
+- Deterministic multilateral netting with conservation checks for every asset.
+- Public-value and confidential guarantee facilities.
+- Atomic reservation, binding, release, and claim of guarantee capacity.
+- Default declaration and a deterministic loss waterfall.
+- Validated snapshots, replay recovery, and authenticated-state restoration.
+- Explicit ports for qualification, zkPI verification, and DeFMI receipts.
 
-## What every path requires
+## Clearing flow
 
-| Path | Quorum approval | DeKYX | zkPI (`InstructionPort`) | DeFMI (`DeFmiPort`) |
-|---|---|---|---|---|
-| CCP capitalization | — | — | — | capital lock verified |
-| Member admission | yes | eligibility verified, one member per subject line | — | default-fund lock verified |
-| Collateral lot | — | — | — | lock verified, lock ids unique across capital, funds, and lots |
-| Margin update | yes | — | — | — |
-| Cycle open / close | yes | — | — | — |
-| Obligation | — | — | verified before netting | — |
-| Cycle settlement | — | — | — | receipt for the exact proposal digest |
-| Guarantee facility | yes | — | — | facility verified; guarantor must be an active member |
-| Guarantee reservation | — | — | — | hold verified; guarantor still active; CAS on sequence (and state digest for confidential facilities) |
-| Guarantee release / claim | — | — | — | receipt for the exact context; claim refused on an expired hold |
-| Default declaration | yes | — | — | — |
-| Default resolution | yes | — | — | receipt for the exact waterfall context |
+```mermaid
+flowchart LR
+    G["Threshold authorities"] --> B["Create and govern ClearingBook"]
+    K["DeKYX\nqualification proof"] --> M["Admit clearing member"]
+    D1["DeFMI\ncapital, fund, collateral locks"] --> M
+    M --> O["Accept verified obligations"]
+    Z["zkPI verifier"] --> O
+    O --> N["Compute net positions"]
+    N --> C{"All risk and conservation\nchecks pass?"}
+    C -->|no| R["Reject without state change"]
+    C -->|yes| S["Settlement proposal"]
+    S --> D2["DeFMI\nsettle exact proposal"]
+    D2 --> E["Record settlement receipt"]
 
-Netting modes: **Gross-Gross** keeps every leg and debits gross risk per
-payer; **Gross-Net** nets only the cycle's settlement asset; **Net-Net** nets
-every asset. Every net position is conserved per asset and every net risk
-debit must fit inside the participant's encumbered margin, or `prepare_close`
-refuses.
+    M --> X["Default declaration"]
+    X --> W["Apply loss waterfall"]
+    W --> D2
+```
 
-## Confidential Aethel guarantees
+DeCCP advances a final clearing or default state only when a DeFMI receipt is
+bound to the exact proposal or waterfall context.
 
-The generic clearing API supports public-value capacity for venues whose risk
-state is transparent. Aethel uses a separate confidential path: DeCCP stores a
-coverage commitment and a DeFMI state digest, never a plaintext guarantee
-amount. Reservations, releases, and claims are compare-and-swap transitions on
-the prior state digest and sequence. A DeFMI adapter must verify the hidden
-amount relation, capacity bound, transition proof, and final receipt before
-DeCCP advances either state. This preserves Aethel's existing
-`coverage_commitment` boundary and prevents concurrent holds from spending the
-same hidden remaining capacity.
+## Main capabilities
 
-`deccp-aethel` exposes `reserve`, `bind_issuance`, `release`, and `claim`. Its
-request and record types carry no amount, capacity, reserved, or consumed
-field, and the adapter tests assert that the DeCCP records it produces contain
-only commitments, digests, identifiers, and timestamps. The adapter does not
-depend on `aethel-core`; an application composes the two.
+### Member admission and margin
 
-## Persistence boundary
+Member admission requires threshold approval, a verified eligibility result,
+and a live DeFMI default-fund lock. DeCCP records a scoped subject line, not a
+legal name. Capital, default-fund, and collateral lock identifiers must be
+unique, preventing one external lock from backing multiple risk positions.
 
-Default-waterfall balances are changed only after both threshold approval and a
-DeFMI receipt for the exact settlement context. `ClearingBook` is deliberately
-not directly deserializable because that would bypass quorum, DeKYX, and DeFMI
-checks. Two recovery routes exist:
+Margin changes and material cycle controls are threshold-approved. Every net
+risk debit must fit inside the participant's encumbered margin or the close
+operation is rejected.
 
-- replay the verified operations; or
-- `ClearingBook::snapshot()` → `ClearingSnapshot` (plain data, canonical
-  digest) → `ClearingBook::restore(trusted_authorities, snapshot, approval)`,
-  which requires the trusted authority set to equal the snapshot's, a quorum
-  approval of the snapshot digest, and every structural invariant
-  (`ClearingBook::validate`): key/id agreement, one margin account per member,
-  unique subject lines and DeFMI locks, facility `reserved`/`consumed` equal to
-  the sum of live and consumed holds, hold status/exposure/receipt shape,
-  cycle status/proposal/receipt shape, and default-case shape; or
-- `ClearingBook::restore_authenticated(snapshot)` for a host whose store is
-  itself authenticated, such as a consensus-committed VM state whose root
-  commits to the snapshot bytes. It skips the separate quorum signature and
-  nothing else: the same invariants run, so a tampered snapshot still fails
-  closed. Storage the host does not authenticate must use `restore`.
+### Multilateral netting
 
-## Why this is not a second DeFMI
+DeCCP supports three modes:
 
-The prior integrated implementation already separated confidential credit and
-waterfall arithmetic from settlement, but placed those reusable modules under
-the DeFMI package and placed guarantee lifecycle in Aethel. This extraction does
-not copy a ledger. DeCCP retains only clearing/risk state and references the
-authoritative DeFMI facility hold or settlement receipt.
+| Mode | Result |
+|---|---|
+| `GrossGross` | Keeps each settlement leg and measures payer risk on a gross basis |
+| `GrossNet` | Nets the designated settlement asset while retaining other gross legs |
+| `NetNet` | Nets every asset across the cycle |
 
-## Aethel cutover status
+For every asset, the sum of net positions must remain zero. The resulting
+proposal has a canonical digest so the settlement receipt cannot be moved to a
+different cycle or set of legs.
 
-Both Aethel paths are cut over. Identity goes through DeKYX; guarantee
-capacity goes through this crate. The Avalanche VM in `mvp/qomm` holds a
-`ClearingBook` in its consensus state (`State::deccp`, persisted as a
-`ClearingSnapshot` and rebuilt with `restore_authenticated`) and drives it
-through `AethelDeCcpAdapter`:
+### Guarantee facilities
 
-| VM transaction | DeCCP operation | Evidence the VM `DeFmiPort` verifies |
-|---|---|---|
-| `issueDeccpClearingBook` | `ClearingBook::new` | CCP capital: a cash note locked under the capital tag, proof digest = its value commitment |
-| `issueDeccpMember` | `admit_participant` | DeKYX presentation for the clearing-membership scope (the `EligibilityPort`); default fund: a cash note locked under the member's tag |
-| `issueDeccpGuaranteeFacility` | `register_confidential_guarantee_facility` | the DeFMI credit facility of the guarantor's DeFMI guarantor id, its cap and beneficiary commitments, and the initial state digest derived from them |
-| `issueAethelGuarantee` | `reserve` | the live DeFMI hold for the coverage commitment; after-state = H(previous, reserve, hold, commitment, DeFMI sequence) |
-| `issueAethelReceivable` | `bind_issuance` | Aethel's own issuance checks and the zkPI |
-| `issueAethelGuaranteeRelease` | `release` | the DeFMI hold released with the named settlement digest |
-| `issueAethelGuaranteeClaim` | `claim` | the DeFMI hold consumed with the claim's settlement digest, plus the zkPI |
+The public-value path tracks facility capacity, reserved capacity, consumed
+capacity, and individual holds. Compare-and-swap sequence checks prevent two
+concurrent requests from spending the same remaining capacity.
 
-DeCCP records the Aethel provider id as the member id, the DeFMI participant
-id as the settlement participant, and the DeKYX subject line as the only
-identity fact. The plaintext capital and default-fund figures are DeCCP's own
-waterfall parameters, quorum-approved and backed by a live DeFMI lock the VM
-cannot open; the Aethel guarantee path never draws on them. Public-value
-facilities, collateral lots, netting cycles, and the default waterfall are not
-offered by that host; its `DeFmiPort` refuses them.
+The confidential path stores a coverage commitment and a DeFMI state digest,
+not a plaintext amount. Reserve, release, and claim operations name the prior
+sequence and digest. The DeFMI adapter must verify the hidden amount relation,
+capacity bound, transition proof, and final receipt before DeCCP advances the
+state.
 
-## Verification
+The `deccp-aethel` crate maps Aethel guarantee lifecycle events to these
+confidential hold transitions without importing Aethel's domain crate.
 
-All tests, Clippy, formatting, and builds run on an approved remote Linux
-worker; the local Mac is for reading, editing, and `cargo fmt`. The latest run
-(OmenX, Rust 1.97.1, after `restore_authenticated` was added): 7 core and 3
-adapter integration tests passed, warning-denied Clippy passed, formatting
-passed, optimized release build passed. The 1.85.1 MSRV `--locked` run dates
-from the previous revision; the test container carries only 1.97.1.
+### Default waterfall
+
+A default case records the triggering evidence, the available defaulter
+resources, mutualized layers, CCP contribution, and the resulting draws. A
+resolution requires threshold approval and a DeFMI receipt for the exact
+waterfall context. A partial or mismatched receipt cannot finalize the case.
+
+## Security and state invariants
+
+Every accepted path checks the invariants relevant to it:
+
+- Threshold approvals are bound to a canonical operation digest.
+- Member subject lines, external locks, obligations, facilities, and holds are
+  unique in their required scope.
+- Incoming obligations must pass `InstructionPort`; a non-zero digest alone is
+  not treated as a valid zkPI.
+- Net positions conserve each asset exactly.
+- Margin and guarantee reservations cannot exceed available capacity.
+- Expired, released, or consumed holds cannot be claimed again.
+- Settlement and default receipts must name the exact proposal context.
+- Invalid operations fail without partially updating clearing state.
+
+## Persistence and recovery
+
+`ClearingBook` is not directly deserializable because unchecked restoration
+would bypass quorum, qualification, and settlement validation. Two supported
+recovery models are available:
+
+1. Replay verified operations into a new book.
+2. Restore a `ClearingSnapshot` after validating its canonical digest,
+   authority set, approval, and all structural invariants.
+
+`restore_authenticated` may be used only when the host storage already commits
+to the exact snapshot bytes, such as consensus state protected by a state root.
+It skips a second snapshot signature, not the structural validation.
+
+## Dependencies and integration
+
+DeCCP's product boundary is independent of the systems connected to its ports.
+
+```mermaid
+flowchart TB
+    DK["DeKYX"] -->|verified eligibility| EP["EligibilityPort"]
+    Z["zkPI"] -->|verified instruction| IP["InstructionPort"]
+    DF["DeFMI"] -->|locks and receipts| DP["DeFmiPort"]
+    EP --> CORE["deccp-core"]
+    IP --> CORE
+    DP --> CORE
+    CORE --> A["deccp-aethel\noptional guarantee adapter"]
+```
+
+| Module | Relationship |
+|---|---|
+| `deccp-core` | Standalone clearing and risk state machine; no dependency on Aethel, DeKYX, zkPI, or DeFMI crates |
+| `deccp-aethel` | Optional adapter built only on `deccp-core` |
+| DeKYX | A host implements `EligibilityPort` to admit qualified members |
+| zkPI | A host implements `InstructionPort` to validate obligations before netting |
+| DeFMI | A host implements `DeFmiPort` to verify external locks, holds, and settlement receipts |
+| Aethel | A host composes Aethel with `deccp-aethel` for receivable guarantees |
+
+This port design lets a deployment replace the credential scheme or settlement
+network without weakening DeCCP's internal invariants.
+
+## Repository layout
+
+```text
+crates/
+├── deccp-core/     Clearing, margin, netting, guarantees, defaults, snapshots
+└── deccp-aethel/   Optional adapter for Aethel guarantee lifecycle events
+```
+
+## Enterprise PoC
+
+[Enterprise PoC guide (Japanese)](docs/ENTERPRISE_POC_JA.md) covers role
+separation, concurrent guarantee reservations, clearing, margin, default,
+recovery, evidence retention and acceptance criteria.
+
+## Build and verification
+
+Run the checks on Linux with the locked dependency graph:
+
+```sh
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo build --workspace --release --locked
+```
+
+The published revision passed these four gates. Production use additionally
+requires independent review of the cryptography, margin model, default rules,
+governance, operational recovery, and applicable clearing regulation.
