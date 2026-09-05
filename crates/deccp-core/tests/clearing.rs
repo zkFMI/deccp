@@ -11,8 +11,7 @@ use deccp_core::{
     GuaranteeHoldStatus, GuaranteeReservation, InstructionPort, MarginUpdate, NettingMode,
     OpenCycleRequest, ParticipantAdmission, QuorumApproval, VerifiedAdmission,
 };
-use ed25519_dalek::SigningKey;
-use rand_core::OsRng;
+use zkfmi_crypto::hybrid::signature::HybridSigner;
 
 fn id(byte: u8) -> [u8; 32] {
     [byte; 32]
@@ -20,23 +19,20 @@ fn id(byte: u8) -> [u8; 32] {
 
 struct Fixture {
     authorities: AuthoritySet,
-    keys: Vec<([u8; 32], SigningKey)>,
+    keys: Vec<([u8; 32], HybridSigner)>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let keys: Vec<_> = (1..=3)
-            .map(|index| (id(index), SigningKey::generate(&mut OsRng)))
+            .map(|index| (id(index), HybridSigner::generate().unwrap()))
             .collect();
         let authorities = AuthoritySet {
             epoch: 1,
             threshold: 2,
             members: keys
                 .iter()
-                .map(|(member_id, key)| AuthorityMember {
-                    member_id: *member_id,
-                    public_key: key.verifying_key().to_bytes(),
-                })
+                .map(|(member_id, key)| authority_member(*member_id, key))
                 .collect(),
         };
         Self { authorities, keys }
@@ -44,13 +40,14 @@ impl Fixture {
 
     fn approval(&self, statement: [u8; 32]) -> QuorumApproval {
         QuorumApproval::sign(
-            self.authorities.epoch,
+            &self.authorities,
             statement,
             &[
                 (self.keys[0].0, &self.keys[0].1),
                 (self.keys[1].0, &self.keys[1].1),
             ],
         )
+        .expect("hybrid quorum")
     }
 }
 
@@ -311,6 +308,7 @@ fn netting_is_conserving_quorum_approved_and_margin_bounded() {
             opened_at: 100,
         },
         &fixture.approval(open_statement),
+        100,
     )
     .unwrap();
     let first_obligation = ClearingObligation {
@@ -358,7 +356,7 @@ fn netting_is_conserving_quorum_approved_and_margin_bounded() {
         vec![70]
     );
     let approval = fixture.approval(proposal.proposal_digest);
-    book.commit_close(proposal.clone(), &approval).unwrap();
+    book.commit_close(proposal.clone(), &approval, 120).unwrap();
     book.record_cycle_settlement(
         &id(50),
         proposal.proposal_digest,
@@ -416,6 +414,7 @@ fn gross_gross_mode_preserves_each_leg_and_requires_gross_margin() {
             opened_at: 100,
         },
         &fixture.approval(open_statement),
+        100,
     )
     .unwrap();
     for obligation in [
@@ -905,7 +904,12 @@ fn snapshot_restores_only_with_quorum_approval_and_intact_invariants() {
     assert_eq!(restored, book);
 
     // One signature is not a quorum, and a foreign authority set is refused.
-    let single = QuorumApproval::sign(1, digest, &[(fixture.keys[0].0, &fixture.keys[0].1)]);
+    let single = QuorumApproval::sign(
+        &fixture.authorities,
+        digest,
+        &[(fixture.keys[0].0, &fixture.keys[0].1)],
+    )
+    .expect("hybrid quorum");
     assert_eq!(
         ClearingBook::restore(&fixture.authorities, snapshot.clone(), &single).map(|_| ()),
         Err(DeCcpError::InsufficientQuorum)
@@ -959,4 +963,105 @@ fn snapshot_restores_only_with_quorum_approval_and_intact_invariants() {
         ClearingBook::restore_authenticated(inflated).map(|_| ()),
         Err(DeCcpError::InvalidState)
     );
+}
+
+fn authority_member(
+    member_id: [u8; 32],
+    signer: &zkfmi_crypto::hybrid::signature::HybridSigner,
+) -> AuthorityMember {
+    use zkfmi_crypto::{
+        key::{KeyId, KeyPurpose, KeyRecord, ParticipantId},
+        traits::Signer as _,
+    };
+    AuthorityMember {
+        member_id,
+        key: KeyRecord {
+            participant_id: ParticipantId::new(format!("fixture-ccp-{}", member_id[0])).unwrap(),
+            key_id: KeyId::new(format!("fixture-ccp-{}-generation-1", member_id[0])).unwrap(),
+            suite: signer.suite(),
+            key_version: 1,
+            purpose: KeyPurpose::Governance,
+            public_key: signer.public_key(),
+            not_before: 1,
+            not_after: 10_000,
+            revoked_at: None,
+            rotation_proof: None,
+            dekyx_binding: None,
+        },
+    }
+}
+
+#[test]
+fn hybrid_authority_rejects_bad_components_epochs_and_expired_keys_without_state_change() {
+    let fixture = Fixture::new();
+    let mut book = new_book(&fixture, 100);
+    let request = admission(10, 20, 30, 40);
+    let statement = request.statement_digest().unwrap();
+    let good = fixture.approval(statement);
+    let before = book.snapshot();
+    for mutation in 0..10 {
+        let mut bad = good.clone();
+        match mutation {
+            0 => bad.signatures[0].signature.pq.clear(),
+            1 => bad.signatures[0].signature.pq[0] ^= 1,
+            2 => bad.signatures[0].signature.classical.clear(),
+            3 => bad.signatures[0].signature.classical[0] ^= 1,
+            4 => bad.authority_epoch += 1,
+            5 => bad.authority_digest[0] ^= 1,
+            6 => bad.signatures[0].key_version += 1,
+            7 => bad.signatures[1] = bad.signatures[0].clone(),
+            8 => {
+                bad.signatures.pop();
+            }
+            _ => bad.suite = zkfmi_crypto::suite::Suite::new(zkfmi_crypto::suite::SuiteId::Ed25519),
+        }
+        assert!(book
+            .admit_participant(request.clone(), &Eligibility, &bad, &Defmi, 100)
+            .is_err());
+        assert_eq!(book.snapshot(), before, "mutation {mutation}");
+    }
+    for revoked in [false, true] {
+        let mut expired = Fixture::new();
+        for member in &mut expired.authorities.members {
+            if revoked {
+                member.key.revoked_at = Some(100);
+            } else {
+                member.key.not_after = 100;
+            }
+        }
+        let mut expired_book = new_book(&expired, 100);
+        let before = expired_book.snapshot();
+        let approval = expired.approval(statement);
+        assert!(expired_book
+            .admit_participant(request.clone(), &Eligibility, &approval, &Defmi, 100)
+            .is_err());
+        assert_eq!(expired_book.snapshot(), before);
+        // Archive integrity does not extend an expired key's execution authority.
+        let snapshot = expired_book.snapshot();
+        let checkpoint = expired.approval(snapshot.digest().unwrap());
+        assert_eq!(
+            ClearingBook::restore(&expired.authorities, snapshot, &checkpoint).unwrap(),
+            expired_book
+        );
+    }
+    let mut repeated = fixture.authorities.clone();
+    let pq = repeated.members[0].key.public_key[32..].to_vec();
+    repeated.members[1].key.public_key[32..].copy_from_slice(&pq);
+    assert_eq!(repeated.validate(), Err(DeCcpError::InvalidAuthoritySet));
+    let mut wrong_purpose = fixture.authorities.clone();
+    wrong_purpose.members[0].key.purpose = zkfmi_crypto::key::KeyPurpose::Attestation;
+    assert_eq!(
+        wrong_purpose.validate(),
+        Err(DeCcpError::InvalidAuthoritySet)
+    );
+    let mut legacy = serde_json::to_value(&good).unwrap();
+    legacy.as_object_mut().unwrap().remove("suite");
+    assert!(serde_json::from_value::<QuorumApproval>(legacy).is_err());
+    book.admit_participant(request.clone(), &Eligibility, &good, &Defmi, 100)
+        .unwrap();
+    let after = book.snapshot();
+    assert!(book
+        .admit_participant(request, &Eligibility, &good, &Defmi, 100)
+        .is_err());
+    assert_eq!(book.snapshot(), after);
 }

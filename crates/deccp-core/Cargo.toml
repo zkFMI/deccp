@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zkfmi-crypto.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true

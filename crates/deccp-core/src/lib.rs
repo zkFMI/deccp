@@ -9,44 +9,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zkfmi_crypto::{
+    hybrid::signature::{HybridSignature, HybridSigner, HybridVerifier},
+    key::{KeyId, KeyPurpose, KeyRecord},
+    suite::{Suite, SuiteId, Version},
+    traits::Signer as _,
+};
 
 pub type Digest32 = [u8; 32];
 pub type Identifier = [u8; 32];
 pub const ZERO: [u8; 32] = [0; 32];
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SignatureBytes {
-    pub first: [u8; 32],
-    pub second: [u8; 32],
-}
-
-impl SignatureBytes {
-    fn from_signature(signature: Signature) -> Self {
-        let bytes = signature.to_bytes();
-        Self {
-            first: bytes[..32].try_into().expect("fixed signature half"),
-            second: bytes[32..].try_into().expect("fixed signature half"),
-        }
-    }
-
-    fn signature(&self) -> Signature {
-        let mut bytes = [0_u8; 64];
-        bytes[..32].copy_from_slice(&self.first);
-        bytes[32..].copy_from_slice(&self.second);
-        Signature::from_bytes(&bytes)
-    }
-}
+/// Both components are mandatory. Legacy 64-byte-only approvals are not accepted.
+pub type SignatureBytes = HybridSignature;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorityMember {
     pub member_id: Identifier,
-    pub public_key: [u8; 32],
+    pub key: KeyRecord,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,13 +46,18 @@ pub struct AuthoritySet {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthoritySignature {
     pub member_id: Identifier,
+    pub key_id: KeyId,
+    pub key_version: u32,
     pub signature: SignatureBytes,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuorumApproval {
+    pub version: Version,
+    pub suite: Suite,
     pub authority_epoch: u64,
+    pub authority_digest: Digest32,
     pub statement_digest: Digest32,
     pub signatures: Vec<AuthoritySignature>,
 }
@@ -78,15 +68,35 @@ impl AuthoritySet {
             || self.threshold == 0
             || self.threshold as usize > self.members.len()
             || self.members.is_empty()
+            || self.members.len() > 64
         {
             return Err(DeCcpError::InvalidAuthoritySet);
         }
         let mut ids = BTreeSet::new();
+        let mut participants = BTreeSet::new();
+        let mut key_ids = BTreeSet::new();
+        let mut classical = BTreeSet::new();
+        let mut pq = BTreeSet::new();
         for member in &self.members {
+            let key = &member.key;
             if member.member_id == ZERO
-                || member.public_key == ZERO
+                || key.validate().is_err()
+                || key.suite != Suite::new(SuiteId::Ed25519MlDsa65)
+                || key.purpose != KeyPurpose::Governance
                 || !ids.insert(member.member_id)
-                || VerifyingKey::from_bytes(&member.public_key).is_err()
+                || !participants.insert(key.participant_id.clone())
+                || !key_ids.insert(key.key_id.clone())
+            {
+                return Err(DeCcpError::InvalidAuthoritySet);
+            }
+            let public: [u8; 32] = key.public_key[..32]
+                .try_into()
+                .map_err(|_| DeCcpError::InvalidAuthoritySet)?;
+            if public == ZERO
+                || VerifyingKey::from_bytes(&public).is_err()
+                || key.public_key[32..].iter().all(|byte| *byte == 0)
+                || !classical.insert(public)
+                || !pq.insert(key.public_key[32..].to_vec())
             {
                 return Err(DeCcpError::InvalidAuthoritySet);
             }
@@ -94,17 +104,59 @@ impl AuthoritySet {
         Ok(())
     }
 
+    pub fn digest(&self) -> Result<Digest32, DeCcpError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self).map_err(|_| DeCcpError::InvalidAuthoritySet)?;
+        Ok(digest_fields(b"DECCP:HYBRID-AUTHORITY:v2", &[&encoded]))
+    }
+
+    fn signing_message(
+        &self,
+        statement: &Digest32,
+        member: &Identifier,
+    ) -> Result<Digest32, DeCcpError> {
+        Ok(digest_fields(
+            b"DECCP:HYBRID-APPROVAL:v2",
+            &[&self.digest()?, member, statement],
+        ))
+    }
+
+    /// The caller supplies the authoritative execution time, never a request timestamp.
     pub fn verify(
         &self,
         statement: &Digest32,
         approval: &QuorumApproval,
+        now: u64,
+    ) -> Result<(), DeCcpError> {
+        self.verify_at(statement, approval, Some(now))
+    }
+
+    /// Integrity-only verification for explicitly requested snapshot restoration.
+    /// Every subsequent operation still uses the current execution-time key checks.
+    fn verify_archived(
+        &self,
+        statement: &Digest32,
+        approval: &QuorumApproval,
+    ) -> Result<(), DeCcpError> {
+        self.verify_at(statement, approval, None)
+    }
+
+    fn verify_at(
+        &self,
+        statement: &Digest32,
+        approval: &QuorumApproval,
+        now: Option<u64>,
     ) -> Result<(), DeCcpError> {
         self.validate()?;
-        if approval.authority_epoch != self.epoch || &approval.statement_digest != statement {
+        if approval.suite != Suite::new(SuiteId::Ed25519MlDsa65)
+            || approval.authority_epoch != self.epoch
+            || approval.authority_digest != self.digest()?
+            || &approval.statement_digest != statement
+            || approval.signatures.len() > self.members.len()
+        {
             return Err(DeCcpError::InvalidQuorumApproval);
         }
         let mut signers = BTreeSet::new();
-        let mut valid = 0usize;
         for signed in &approval.signatures {
             if !signers.insert(signed.member_id) {
                 return Err(DeCcpError::InvalidQuorumApproval);
@@ -114,13 +166,23 @@ impl AuthoritySet {
                 .iter()
                 .find(|member| member.member_id == signed.member_id)
                 .ok_or(DeCcpError::InvalidQuorumApproval)?;
-            VerifyingKey::from_bytes(&member.public_key)
-                .map_err(|_| DeCcpError::InvalidAuthoritySet)?
-                .verify(statement, &signed.signature.signature())
+            let key = &member.key;
+            if signed.key_id != key.key_id
+                || signed.key_version != key.key_version
+                || now.is_some_and(|at| key.valid_at(at).is_err())
+            {
+                return Err(DeCcpError::InvalidQuorumApproval);
+            }
+            HybridVerifier
+                .verify_hybrid(
+                    KeyPurpose::Governance,
+                    &key.public_key,
+                    &self.signing_message(statement, &signed.member_id)?,
+                    &signed.signature,
+                )
                 .map_err(|_| DeCcpError::InvalidQuorumApproval)?;
-            valid += 1;
         }
-        if valid < self.threshold as usize {
+        if signers.len() < self.threshold as usize {
             return Err(DeCcpError::InsufficientQuorum);
         }
         Ok(())
@@ -129,21 +191,43 @@ impl AuthoritySet {
 
 impl QuorumApproval {
     pub fn sign(
-        authority_epoch: u64,
+        authorities: &AuthoritySet,
         statement_digest: Digest32,
-        signers: &[(Identifier, &SigningKey)],
-    ) -> Self {
-        Self {
-            authority_epoch,
-            statement_digest,
-            signatures: signers
+        signers: &[(Identifier, &HybridSigner)],
+    ) -> Result<Self, DeCcpError> {
+        authorities.validate()?;
+        let mut seen = BTreeSet::new();
+        let mut signatures = Vec::new();
+        for (member_id, signer) in signers {
+            let member = authorities
+                .members
                 .iter()
-                .map(|(member_id, key)| AuthoritySignature {
-                    member_id: *member_id,
-                    signature: SignatureBytes::from_signature(key.sign(&statement_digest)),
-                })
-                .collect(),
+                .find(|member| member.member_id == *member_id)
+                .ok_or(DeCcpError::InvalidQuorumApproval)?;
+            if !seen.insert(*member_id) || signer.public_key() != member.key.public_key {
+                return Err(DeCcpError::InvalidQuorumApproval);
+            }
+            let signature = signer
+                .sign_hybrid(
+                    KeyPurpose::Governance,
+                    &authorities.signing_message(&statement_digest, member_id)?,
+                )
+                .map_err(|_| DeCcpError::InvalidQuorumApproval)?;
+            signatures.push(AuthoritySignature {
+                member_id: *member_id,
+                key_id: member.key.key_id.clone(),
+                key_version: member.key.key_version,
+                signature,
+            });
         }
+        Ok(Self {
+            version: Version::V1,
+            suite: Suite::new(SuiteId::Ed25519MlDsa65),
+            authority_epoch: authorities.epoch,
+            authority_digest: authorities.digest()?,
+            statement_digest,
+            signatures,
+        })
     }
 }
 
@@ -942,7 +1026,7 @@ impl ClearingBook {
         if &snapshot.authorities != trusted {
             return Err(DeCcpError::InvalidAuthoritySet);
         }
-        trusted.verify(&snapshot.digest()?, approval)?;
+        trusted.verify_archived(&snapshot.digest()?, approval)?;
         Self::restore_authenticated(snapshot)
     }
 
@@ -1152,7 +1236,7 @@ impl ClearingBook {
         now: u64,
     ) -> Result<(), DeCcpError> {
         let statement = request.statement_digest()?;
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         if request.admitted_at != now || self.operation_used(&request.operation_id) {
             return Err(DeCcpError::ReplayOrStaleOperation);
         }
@@ -1259,7 +1343,7 @@ impl ClearingBook {
             return Err(DeCcpError::InvalidMargin);
         }
         let statement = request.statement_digest();
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         let required = request
             .initial_margin
             .checked_add(request.variation_margin)
@@ -1288,6 +1372,7 @@ impl ClearingBook {
         &mut self,
         request: OpenCycleRequest,
         approval: &QuorumApproval,
+        now: u64,
     ) -> Result<(), DeCcpError> {
         if [
             request.operation_id,
@@ -1297,13 +1382,14 @@ impl ClearingBook {
         ]
         .contains(&ZERO)
             || request.opened_at == 0
+            || request.opened_at != now
             || self.operation_used(&request.operation_id)
             || self.cycles.contains_key(&id_key(&request.cycle_id))
         {
             return Err(DeCcpError::InvalidCycle);
         }
         let statement = request.statement_digest();
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         self.cycles.insert(
             id_key(&request.cycle_id),
             NettingCycle {
@@ -1517,9 +1603,10 @@ impl ClearingBook {
         &mut self,
         proposal: NettingProposal,
         approval: &QuorumApproval,
+        now: u64,
     ) -> Result<(), DeCcpError> {
         self.authorities
-            .verify(&proposal.proposal_digest, approval)?;
+            .verify(&proposal.proposal_digest, approval, now)?;
         if self.prepare_close(&proposal.cycle_id)? != proposal {
             return Err(DeCcpError::InvalidNettingProposal);
         }
@@ -1603,7 +1690,7 @@ impl ClearingBook {
             .verify_guarantee_facility(&facility, now)
             .map_err(DeCcpError::DeFmiEvidenceRejected)?;
         let statement = guarantee_facility_statement(&operation_id, &facility);
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         self.guarantee_facilities
             .insert(id_key(&facility.facility_id), facility);
         self.consume_operation(&operation_id)
@@ -1866,7 +1953,7 @@ impl ClearingBook {
             .verify_confidential_guarantee_facility(&facility, now)
             .map_err(DeCcpError::DeFmiEvidenceRejected)?;
         let statement = confidential_guarantee_facility_statement(&operation_id, &facility);
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         self.confidential_guarantee_facilities
             .insert(id_key(&facility.facility_id), facility);
         self.consume_operation(&operation_id)
@@ -2139,7 +2226,7 @@ impl ClearingBook {
                 &now.to_be_bytes(),
             ],
         );
-        self.authorities.verify(&statement, approval)?;
+        self.authorities.verify(&statement, approval, now)?;
         self.participants
             .get_mut(&id_key(&evidence.participant_id))
             .ok_or(DeCcpError::UnknownParticipant)?
@@ -2250,7 +2337,7 @@ impl ClearingBook {
         now: u64,
     ) -> Result<(), DeCcpError> {
         self.authorities
-            .verify(&resolution.resolution_digest, approval)?;
+            .verify(&resolution.resolution_digest, approval, now)?;
         if self.prepare_default_resolution(&resolution.case_id, resolution.shortfall)? != resolution
             || receipt.receipt_digest == ZERO
             || receipt.context_digest != resolution.settlement_context_digest
