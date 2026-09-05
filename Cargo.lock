@@ -76,17 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deccp-aethel"
-version = "0.1.0"
-dependencies = [
- "deccp-core",
- "ed25519-dalek",
- "rand_core",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "deccp-core"
 version = "0.1.0"
 dependencies = [

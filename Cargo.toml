@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/deccp-core", "crates/deccp-aethel"]
+members = ["crates/deccp-core"]
 resolver = "2"
 
 [workspace.package]
@@ -14,4 +14,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 thiserror = "2.0.17"
 serde_json = "1.0.145"
-

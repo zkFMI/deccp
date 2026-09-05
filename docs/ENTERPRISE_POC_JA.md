@@ -173,10 +173,10 @@ cargo test --locked -p deccp-core --test clearing \
 
 ## 9. Aethel接続を確認する場合
 
-`deccp-aethel` は、金額を平文で持たず、Aethel保証とDeCCP holdを結ぶadapterである。
+Aethelリポジトリの `aethel-deccp` は、金額を平文で持たず、Aethel保証とDeCCP holdを結ぶadapterである。
 
 ```sh
-cargo test --locked -p deccp-aethel --test adapter -- --nocapture
+cargo test --manifest-path ../aethel/Cargo.toml --locked -p aethel-deccp --test adapter -- --nocapture
 ```
 
 DeCCP coreへAethelの債権・stream状態を入れず、adapterがIDと検証文を対応づける。
@@ -224,12 +224,11 @@ DeCCP coreへAethelの債権・stream状態を入れず、adapterがIDと検証�
 
 ## 13. 実装の構成と限界
 
-workspaceは二つのcrateからなる。
+workspaceは汎用の `deccp-core` だけからなる。Aethel専用adapterはAethelリポジトリに移した。
 
 | crate | 責任 | 責任外 |
 |---|---|---|
 | `deccp-core` | 権限者、参加者、証拠金、担保参照、債務、ネッティング、保証、破綻、snapshot | 本人確認、資産正本、実際の送金 |
-| `deccp-aethel` | Aethelの保証要求をDeCCP保証holdへ結ぶ | Aethel債権契約、DeFMI残高 |
 
 現在のリポジトリは決定的なRust状態機械とadapter境界を提供する。完成済みの公開API、運営管理画面、
 margin計算engine、価格配信、Avalanche node、HSM adapter、規制reportingは含まれない。企業PoCでは
@@ -654,7 +653,7 @@ wallet IDでは集約しない。
 
 ## 29. Aethel保証接続
 
-`deccp-aethel` は、Aethelの支払stream/債権とDeCCPの保証facility/holdをIDとdigestで結ぶ。
+`aethel-deccp` は、Aethelの支払stream/債権とDeCCPの保証facility/holdをIDとdigestで結ぶ。
 
 完全経路:
 

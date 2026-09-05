@@ -90,8 +90,9 @@ sequence and digest. The DeFMI adapter must verify the hidden amount relation,
 capacity bound, transition proof, and final receipt before DeCCP advances the
 state.
 
-The `deccp-aethel` crate maps Aethel guarantee lifecycle events to these
-confidential hold transitions without importing Aethel's domain crate.
+Application-specific adapters belong to their consuming application. The Aethel
+repository owns `aethel-deccp`, which maps its guarantee lifecycle to these
+confidential hold transitions. DeCCP neither imports nor hosts that adapter.
 
 ### Default waterfall
 
@@ -141,17 +142,16 @@ flowchart TB
     EP --> CORE["deccp-core"]
     IP --> CORE
     DP --> CORE
-    CORE --> A["deccp-aethel\noptional guarantee adapter"]
+    A["Application-owned adapter"] -->|depends on| CORE
 ```
 
 | Module | Relationship |
 |---|---|
 | `deccp-core` | Standalone clearing and risk state machine; no dependency on Aethel, DeKYX, zkPI, or DeFMI crates |
-| `deccp-aethel` | Optional adapter built only on `deccp-core` |
 | DeKYX | A host implements `EligibilityPort` to admit qualified members |
 | zkPI | A host implements `InstructionPort` to validate obligations before netting |
 | DeFMI | A host implements `DeFmiPort` to verify external locks, holds, and settlement receipts |
-| Aethel | A host composes Aethel with `deccp-aethel` for receivable guarantees |
+| Application integrations | Kept outside this repository; applications implement the ports and depend on `deccp-core` |
 
 This port design lets a deployment replace the credential scheme or settlement
 network without weakening DeCCP's internal invariants.
@@ -160,8 +160,7 @@ network without weakening DeCCP's internal invariants.
 
 ```text
 crates/
-├── deccp-core/     Clearing, margin, netting, guarantees, defaults, snapshots
-└── deccp-aethel/   Optional adapter for Aethel guarantee lifecycle events
+└── deccp-core/     Clearing, margin, netting, guarantees, defaults, snapshots
 ```
 
 ## Enterprise PoC
