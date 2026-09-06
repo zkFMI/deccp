@@ -44,7 +44,7 @@ PoCでは架空の参加者、資産、証拠金、破綻事例を使う。
 ## 1. ソースと基準試験を固定する
 
 ```sh
-git clone https://github.com/shukob/deccp.git
+git clone https://github.com/zkFMI/deccp.git
 cd deccp
 git checkout <社内で承認したcommit>
 git rev-parse HEAD
@@ -371,7 +371,7 @@ DeFMI VM内で動かす場合はDeFMI validator資源にstate/proof検証負荷�
 ## 19. ソースと成果物を固定する
 
 ```sh
-git clone https://github.com/shukob/deccp.git
+git clone https://github.com/zkFMI/deccp.git
 cd deccp
 git checkout <承認commit>
 git rev-parse HEAD
